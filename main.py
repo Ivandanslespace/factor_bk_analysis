@@ -1,3 +1,4 @@
+import re
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -6,22 +7,28 @@ import seaborn as sns
 
 class FactorStabilityAnalyzer:
     """
-    Outil d'analyse pour des facteurs et combinaisons de facteurs.
-    Le DataFrame d'entrée doit contenir :
-    - un index de dates
-    - des colonnes = noms de facteurs
-    - des valeurs = ratio cumulatif vs benchmark (strictement positif)
+    Outil d'analyse pour des facteurs simples et combinés.
+
+    Hypothèses sur les données :
+    - index : dates
+    - colonnes : noms des facteurs
+    - valeurs : ratio cumulatif vs benchmark, strictement positif
+
+    Exemples de noms :
+    - facteur simple : 'PCT ROE'
+    - facteur combiné : 'CROSS_PCT ROE_x_PCT PE LTM'
+    - facteur combiné à 3 briques : 'CROSS_A_x_B_x_C'
     """
 
     def __init__(self, df: pd.DataFrame, ann_factor: int = 252):
-        # Initialisation de l'objet
+        # Initialisation de l'analyseur
         self.ann_factor = ann_factor
         self.df = self._prepare_df(df)
         self.factor_map = self._build_factor_map()
 
     @staticmethod
     def _prepare_df(df: pd.DataFrame) -> pd.DataFrame:
-        # Nettoyage et harmonisation du DataFrame
+        # Préparation propre du DataFrame
         x = df.copy()
         x.index = pd.to_datetime(x.index)
         x = x.sort_index()
@@ -31,12 +38,42 @@ class FactorStabilityAnalyzer:
         x = x.dropna(axis=1, how="all")
         return x
 
+    @staticmethod
+    def _normalize_spaces(name: str) -> str:
+        # Normalisation des espaces
+        return re.sub(r"\s+", " ", str(name)).strip()
+
+    @classmethod
+    def _clean_factor_token(cls, name: str) -> str:
+        # Nettoyage d'un morceau de nom de facteur
+        x = cls._normalize_spaces(name)
+
+        # Suppression des préfixes techniques éventuels
+        x = re.sub(r"^(CROSS_|COMBO_)+", "", x)
+
+        # Normalisation finale des espaces
+        x = cls._normalize_spaces(x)
+        return x
+
+    def _parse_factor_parts(self, col: str):
+        # Découpage intelligent d'un nom de facteur
+        col = self._normalize_spaces(col)
+
+        if "_x_" not in col:
+            return [self._clean_factor_token(col)]
+
+        parts = col.split("_x_")
+        parts = [self._clean_factor_token(p) for p in parts]
+        return parts
+
     def _build_factor_map(self) -> pd.DataFrame:
-        # Construction d'une table descriptive des facteurs
+        # Construction de la table descriptive des facteurs
         records = []
+
         for col in self.df.columns:
-            is_combo = "_x_" in col
-            parts = col.split("_x_") if is_combo else [col]
+            is_combo = "_x_" in str(col)
+            parts = self._parse_factor_parts(col)
+
             records.append(
                 {
                     "factor": col,
@@ -45,14 +82,17 @@ class FactorStabilityAnalyzer:
                     "parts": parts,
                 }
             )
-        return pd.DataFrame(records).set_index("factor")
+
+        out = pd.DataFrame(records).set_index("factor")
+        return out
 
     @staticmethod
     def _max_drawdown_from_array(arr: np.ndarray) -> float:
-        # Calcul du drawdown maximal d'une série cumulative
+        # Calcul du drawdown maximal
         x = np.asarray(arr, dtype=float)
-        if len(x) < 2 or np.any(~np.isfinite(x)) or x[0] <= 0:
+        if len(x) < 2 or np.any(~np.isfinite(x)) or np.any(x <= 0):
             return np.nan
+
         x = x / x[0]
         peak = np.maximum.accumulate(x)
         dd = x / peak - 1.0
@@ -62,8 +102,9 @@ class FactorStabilityAnalyzer:
     def _ulcer_index_from_array(arr: np.ndarray) -> float:
         # Calcul de l'Ulcer Index
         x = np.asarray(arr, dtype=float)
-        if len(x) < 2 or np.any(~np.isfinite(x)) or x[0] <= 0:
+        if len(x) < 2 or np.any(~np.isfinite(x)) or np.any(x <= 0):
             return np.nan
+
         x = x / x[0]
         peak = np.maximum.accumulate(x)
         dd = x / peak - 1.0
@@ -71,10 +112,11 @@ class FactorStabilityAnalyzer:
 
     @staticmethod
     def _monotonicity_from_array(arr: np.ndarray) -> float:
-        # Part des variations journalières positives en log
+        # Part des rendements log positifs
         x = np.asarray(arr, dtype=float)
         if len(x) < 3 or np.any(~np.isfinite(x)) or np.any(x <= 0):
             return np.nan
+
         r = np.diff(np.log(x))
         if len(r) == 0:
             return np.nan
@@ -82,10 +124,11 @@ class FactorStabilityAnalyzer:
 
     @staticmethod
     def _new_high_share_from_array(arr: np.ndarray) -> float:
-        # Part du temps passé sur un plus haut historique
+        # Part du temps passée sur un plus haut historique
         x = np.asarray(arr, dtype=float)
         if len(x) < 2 or np.any(~np.isfinite(x)):
             return np.nan
+
         peak = np.maximum.accumulate(x)
         return float(np.mean(np.isclose(x, peak, rtol=1e-10, atol=1e-12)))
 
@@ -95,29 +138,58 @@ class FactorStabilityAnalyzer:
         x = np.asarray(arr, dtype=float)
         if len(x) < 5 or np.any(~np.isfinite(x)) or np.any(x <= 0):
             return np.nan, np.nan
+
         y = np.log(x)
         t = np.arange(len(y), dtype=float)
+
         slope, intercept = np.polyfit(t, y, 1)
         y_hat = slope * t + intercept
+
         ss_res = np.sum((y - y_hat) ** 2)
         ss_tot = np.sum((y - np.mean(y)) ** 2)
         r2 = 1.0 - ss_res / ss_tot if ss_tot > 0 else np.nan
+
         return float(slope), float(r2)
 
     @staticmethod
     def _safe_rank_pct(s: pd.Series, ascending: bool = True) -> pd.Series:
-        # Conversion d'une métrique en percentile de rang
-        if ascending:
-            return s.rank(pct=True, ascending=True)
-        return s.rank(pct=True, ascending=False)
+        # Conversion d'une métrique en percentile
+        return s.rank(pct=True, ascending=ascending)
 
     def _series(self, col: str) -> pd.Series:
         # Extraction propre d'une série
         return self.df[col].dropna()
 
+    def debug_combo_mapping(self, max_rows: int = 50) -> pd.DataFrame:
+        # Diagnostic du mapping entre facteurs combinés et briques simples
+        rows = []
+
+        combo_names = self.factor_map.index[self.factor_map["is_combo"]]
+
+        for combo in combo_names:
+            parts = self.factor_map.loc[combo, "parts"]
+            exists = [p in self.df.columns for p in parts]
+
+            rows.append(
+                {
+                    "combo": combo,
+                    "parts": parts,
+                    "n_parts": len(parts),
+                    "all_parts_found": all(exists),
+                    "missing_parts": [p for p, ok in zip(parts, exists) if not ok],
+                }
+            )
+
+        out = pd.DataFrame(rows)
+        if len(out) == 0:
+            return out
+
+        return out.head(max_rows)
+
     def full_period_stats(self) -> pd.DataFrame:
         # Statistiques globales sur toute la période
         rows = []
+
         for col in self.df.columns:
             s = self._series(col)
             if len(s) < 10:
@@ -133,7 +205,11 @@ class FactorStabilityAnalyzer:
 
             downside = log_ret[log_ret < 0]
             downside_std = downside.std() * np.sqrt(self.ann_factor) if len(downside) > 1 else np.nan
-            sortino = (log_ret.mean() * self.ann_factor / downside_std) if pd.notna(downside_std) and downside_std > 0 else np.nan
+            sortino = (
+                (log_ret.mean() * self.ann_factor / downside_std)
+                if pd.notna(downside_std) and downside_std > 0
+                else np.nan
+            )
 
             mdd = self._max_drawdown_from_array(rel.values)
             ulcer = self._ulcer_index_from_array(rel.values)
@@ -164,7 +240,8 @@ class FactorStabilityAnalyzer:
                 }
             )
 
-        out = pd.DataFrame(rows).set_index("factor").sort_values("cagr", ascending=False)
+        out = pd.DataFrame(rows).set_index("factor")
+        out = out.sort_values("cagr", ascending=False)
         return out
 
     def rolling_analysis(self, window: int = 252):
@@ -187,10 +264,12 @@ class FactorStabilityAnalyzer:
                 lambda x: self._max_drawdown_from_array(np.asarray(x, dtype=float)),
                 raw=True,
             )
+
             rolling_mono[col] = s.rolling(window).apply(
                 lambda x: self._monotonicity_from_array(np.asarray(x, dtype=float)),
                 raw=True,
             )
+
             rolling_new_high[col] = s.rolling(window).apply(
                 lambda x: self._new_high_share_from_array(np.asarray(x, dtype=float)),
                 raw=True,
@@ -225,12 +304,13 @@ class FactorStabilityAnalyzer:
             rnh = ra["rolling_new_high"]
 
             rows = []
+
             for col in base.index:
-                x_rr = rr[col].dropna()
-                x_rc = rc[col].dropna()
-                x_rm = rm[col].dropna()
-                x_rmo = rmo[col].dropna()
-                x_rnh = rnh[col].dropna()
+                x_rr = rr[col].dropna() if col in rr.columns else pd.Series(dtype=float)
+                x_rc = rc[col].dropna() if col in rc.columns else pd.Series(dtype=float)
+                x_rm = rm[col].dropna() if col in rm.columns else pd.Series(dtype=float)
+                x_rmo = rmo[col].dropna() if col in rmo.columns else pd.Series(dtype=float)
+                x_rnh = rnh[col].dropna() if col in rnh.columns else pd.Series(dtype=float)
 
                 if len(x_rr) == 0:
                     continue
@@ -250,55 +330,50 @@ class FactorStabilityAnalyzer:
                     }
                 )
 
-            tmp = pd.DataFrame(rows).set_index("factor")
-            all_scores.append(tmp)
+            tmp = pd.DataFrame(rows)
+            if len(tmp) > 0:
+                tmp = tmp.set_index("factor")
+                all_scores.append(tmp)
 
         if len(all_scores) == 0:
+            base["stability_score"] = np.nan
             return base
 
         score_df = pd.concat(all_scores, axis=1)
         out = base.join(score_df, how="left")
 
-        # Score agrégé : plus il est élevé, plus le facteur est "stable"
         score_parts = []
 
         for w in windows:
-            cols_needed = [
-                f"win_{w}_pct_positive",
-                f"win_{w}_p10_return",
-                f"win_{w}_median_mdd",
-                f"win_{w}_low_dd_share",
-                f"win_{w}_median_monotonicity",
-                f"win_{w}_median_new_high",
-            ]
-            existing = [c for c in cols_needed if c in out.columns]
-            if len(existing) == 0:
-                continue
-
             part = pd.DataFrame(index=out.index)
+
             if f"win_{w}_pct_positive" in out.columns:
                 part["a"] = self._safe_rank_pct(out[f"win_{w}_pct_positive"], ascending=True)
+
             if f"win_{w}_p10_return" in out.columns:
                 part["b"] = self._safe_rank_pct(out[f"win_{w}_p10_return"], ascending=True)
+
             if f"win_{w}_median_mdd" in out.columns:
                 part["c"] = self._safe_rank_pct(out[f"win_{w}_median_mdd"], ascending=True)
+
             if f"win_{w}_low_dd_share" in out.columns:
                 part["d"] = self._safe_rank_pct(out[f"win_{w}_low_dd_share"], ascending=True)
+
             if f"win_{w}_median_monotonicity" in out.columns:
                 part["e"] = self._safe_rank_pct(out[f"win_{w}_median_monotonicity"], ascending=True)
+
             if f"win_{w}_median_new_high" in out.columns:
                 part["f"] = self._safe_rank_pct(out[f"win_{w}_median_new_high"], ascending=True)
 
-            out[f"stability_score_{w}"] = part.mean(axis=1)
-            score_parts.append(out[f"stability_score_{w}"])
+            if part.shape[1] > 0:
+                out[f"stability_score_{w}"] = part.mean(axis=1)
+                score_parts.append(out[f"stability_score_{w}"])
 
-        # Score global long terme
         if len(score_parts) > 0:
             out["stability_score"] = pd.concat(score_parts, axis=1).mean(axis=1)
         else:
             out["stability_score"] = np.nan
 
-        # Bonus pour une courbe globale propre
         out["stability_score"] = (
             0.70 * out["stability_score"].fillna(0)
             + 0.10 * self._safe_rank_pct(out["monotonicity"], ascending=True).fillna(0)
@@ -310,33 +385,38 @@ class FactorStabilityAnalyzer:
         return out
 
     def yearly_returns(self) -> pd.DataFrame:
-        # Rendement calendaire annuel du ratio cumulatif
+        # Rendements calendaires annuels
         yearly_level = self.df.resample("Y").last()
         yearly_ret = yearly_level.pct_change()
         yearly_ret.index = yearly_ret.index.year
         return yearly_ret
 
     def horizon_success_matrix(self, horizons=(63, 126, 252, 504)) -> pd.DataFrame:
-        # Part des fenêtres glissantes positives selon plusieurs horizons
+        # Taux de succès selon plusieurs horizons
         rows = []
+
         for col in self.df.columns:
             s = self._series(col)
             if len(s) < max(horizons) + 5:
                 continue
 
             record = {"factor": col}
+
             for h in horizons:
                 r = (s / s.shift(h) - 1.0).dropna()
                 record[f"positive_rate_{h}d"] = (r > 0).mean() if len(r) else np.nan
                 record[f"p10_return_{h}d"] = r.quantile(0.10) if len(r) else np.nan
                 record[f"worst_return_{h}d"] = r.min() if len(r) else np.nan
+
             rows.append(record)
 
-        return pd.DataFrame(rows).set_index("factor")
+        out = pd.DataFrame(rows).set_index("factor")
+        return out
 
     def start_date_robustness(self, min_horizon: int = 252) -> pd.DataFrame:
-        # Robustesse du choix de la date de départ jusqu'à aujourd'hui
+        # Robustesse au choix de la date de départ
         rows = []
+
         for col in self.df.columns:
             s = self._series(col)
             if len(s) <= min_horizon:
@@ -348,8 +428,10 @@ class FactorStabilityAnalyzer:
             for i in range(0, len(s) - min_horizon):
                 sub = s.iloc[i:]
                 n = len(sub) - 1
+
                 if n < min_horizon:
                     continue
+
                 rel = sub.iloc[-1] / sub.iloc[0]
                 total_returns.append(rel - 1.0)
                 ann_returns.append(rel ** (self.ann_factor / n) - 1.0)
@@ -372,17 +454,24 @@ class FactorStabilityAnalyzer:
                 }
             )
 
-        out = pd.DataFrame(rows).set_index("factor")
-        return out.sort_values("start_date_win_rate_to_today", ascending=False)
+        out = pd.DataFrame(rows)
+        if len(out) == 0:
+            return pd.DataFrame()
+
+        out = out.set_index("factor")
+        out = out.sort_values("start_date_win_rate_to_today", ascending=False)
+        return out
 
     def synergy_analysis(self, min_obs: int = 252, window_for_path: int = 252) -> pd.DataFrame:
-        # Analyse de l'effet de synergie des facteurs combinés
+        # Analyse de la synergie des facteurs combinés
         records = []
 
-        for combo in self.factor_map.index[self.factor_map["is_combo"]]:
+        combo_names = self.factor_map.index[self.factor_map["is_combo"]]
+
+        for combo in combo_names:
             parts = self.factor_map.loc[combo, "parts"]
 
-            # Vérification de l'existence des facteurs simples
+            # Vérification de l'existence des briques simples
             if not all(p in self.df.columns for p in parts):
                 continue
 
@@ -399,10 +488,10 @@ class FactorStabilityAnalyzer:
             part_df = aligned.iloc[:, 1:]
             part_names = list(part_df.columns)
 
-            # Baseline géométrique : moyenne des logs
+            # Baseline géométrique des briques simples
             geo_baseline = np.exp(np.log(part_df).mean(axis=1))
 
-            # Baseline "meilleur composant"
+            # Baseline du meilleur facteur simple à chaque date
             best_baseline = part_df.max(axis=1)
 
             combo_rel = combo_s / combo_s.iloc[0]
@@ -414,6 +503,7 @@ class FactorStabilityAnalyzer:
 
             part_mdds = []
             part_monos = []
+
             for p in part_names:
                 p_rel = part_df[p] / part_df[p].iloc[0]
                 part_mdds.append(self._max_drawdown_from_array(p_rel.values))
@@ -428,8 +518,8 @@ class FactorStabilityAnalyzer:
             share_above_geo = (combo_rel > geo_rel).mean()
             share_above_best = (combo_rel > best_rel).mean()
 
-            # Lift de stabilité sur fenêtre glissante
             combo_roll = (combo_s / combo_s.shift(window_for_path) - 1.0).dropna()
+
             parts_roll = []
             for p in part_names:
                 r = (part_df[p] / part_df[p].shift(window_for_path) - 1.0).dropna()
@@ -463,17 +553,47 @@ class FactorStabilityAnalyzer:
                     "drawdown_lift": combo_mdd - avg_part_mdd,
                     f"combo_positive_rate_{window_for_path}d": combo_positive_rate,
                     f"avg_parts_positive_rate_{window_for_path}d": avg_positive_rate_parts,
-                    f"positive_rate_lift_{window_for_path}d": combo_positive_rate - avg_positive_rate_parts if pd.notna(combo_positive_rate) and pd.notna(avg_positive_rate_parts) else np.nan,
+                    f"positive_rate_lift_{window_for_path}d": (
+                        combo_positive_rate - avg_positive_rate_parts
+                        if pd.notna(combo_positive_rate) and pd.notna(avg_positive_rate_parts)
+                        else np.nan
+                    ),
                 }
             )
 
+        empty_columns = [
+            "parts",
+            "n_parts",
+            "n_obs",
+            "combo_final_ratio",
+            "geo_baseline_final_ratio",
+            "best_single_final_ratio",
+            "edge_terminal_vs_geo_log",
+            "edge_terminal_vs_best_log",
+            "share_above_geo_path",
+            "share_above_best_path",
+            "combo_monotonicity",
+            "avg_parts_monotonicity",
+            "monotonicity_lift",
+            "combo_max_drawdown",
+            "avg_parts_max_drawdown",
+            "drawdown_lift",
+            f"combo_positive_rate_{window_for_path}d",
+            f"avg_parts_positive_rate_{window_for_path}d",
+            f"positive_rate_lift_{window_for_path}d",
+            "synergy_score",
+        ]
+
         out = pd.DataFrame(records)
+
+        # Retour d'une table vide mais structurée
         if len(out) == 0:
+            out = pd.DataFrame(columns=empty_columns)
+            out.index.name = "combo"
             return out
 
         out = out.set_index("combo")
 
-        # Score synthétique de synergie
         out["synergy_score"] = (
             0.25 * self._safe_rank_pct(out["edge_terminal_vs_geo_log"], ascending=True).fillna(0)
             + 0.20 * self._safe_rank_pct(out["share_above_geo_path"], ascending=True).fillna(0)
@@ -499,12 +619,18 @@ class FactorStabilityAnalyzer:
             drawdown_limit=drawdown_limit,
             min_obs=min_obs,
         )
+
         start_rob = self.start_date_robustness(min_horizon=min_horizon)
         horizon = self.horizon_success_matrix(horizons=windows)
 
-        master = stability.join(start_rob, how="left").join(horizon, how="left")
+        master = stability.copy()
 
-        # Score final orienté "stabilité avant performance brute"
+        if start_rob is not None and len(start_rob) > 0:
+            master = master.join(start_rob, how="left")
+
+        if horizon is not None and len(horizon) > 0:
+            master = master.join(horizon, how="left")
+
         master["robust_uptrend_score"] = (
             0.45 * self._safe_rank_pct(master["stability_score"], ascending=True).fillna(0)
             + 0.20 * self._safe_rank_pct(master["start_date_win_rate_to_today"], ascending=True).fillna(0)
@@ -517,10 +643,11 @@ class FactorStabilityAnalyzer:
         return master
 
     def plot_top_stable_factors(self, master_table: pd.DataFrame, top_n: int = 12, figsize=(14, 7)):
-        # Graphique des meilleurs facteurs stables
+        # Courbes des meilleurs facteurs stables
         top_cols = master_table.head(top_n).index.tolist()
 
         plt.figure(figsize=figsize)
+
         for col in top_cols:
             s = self._series(col)
             rel = s / s.iloc[0]
@@ -535,7 +662,7 @@ class FactorStabilityAnalyzer:
         plt.show()
 
     def plot_yearly_heatmap(self, master_table: pd.DataFrame, top_n: int = 20, figsize=(16, 8)):
-        # Carte de chaleur des rendements annuels
+        # Heatmap des rendements annuels
         top_cols = master_table.head(top_n).index.tolist()
         yearly = self.yearly_returns()[top_cols].T
 
@@ -554,7 +681,7 @@ class FactorStabilityAnalyzer:
         plt.tight_layout()
         plt.show()
 
-    def plot_synergy_scatter(self, synergy_table: pd.DataFrame, top_n: int = 40, figsize=(10, 7)):
+    def plot_synergy_scatter(self, synergy_table: pd.DataFrame, top_n: int = 40, figsize=(11, 7)):
         # Nuage de points pour visualiser la synergie
         if synergy_table is None or len(synergy_table) == 0:
             print("Aucune combinaison exploitable.")
@@ -586,49 +713,3 @@ class FactorStabilityAnalyzer:
         plt.tight_layout()
         plt.show()
 
-
-# =========================
-# Exemple d'utilisation
-# =========================
-
-# analyseur = FactorStabilityAnalyzer(df, ann_factor=252)
-
-# table principale
-# master = analyseur.build_master_table(
-#     windows=(126, 252, 504),
-#     drawdown_limit=0.15,
-#     min_obs=252,
-#     min_horizon=252
-# )
-
-# analyse de synergie
-# synergy = analyseur.synergy_analysis(
-#     min_obs=252,
-#     window_for_path=252
-# )
-
-# affichage des meilleurs facteurs "stables"
-# print(master.head(20)[[
-#     "final_ratio",
-#     "cagr",
-#     "max_drawdown",
-#     "monotonicity",
-#     "stability_score",
-#     "start_date_win_rate_to_today",
-#     "robust_uptrend_score"
-# ]])
-
-# affichage des meilleures combinaisons
-# print(synergy.head(20)[[
-#     "parts",
-#     "edge_terminal_vs_geo_log",
-#     "share_above_geo_path",
-#     "monotonicity_lift",
-#     "drawdown_lift",
-#     "synergy_score"
-# ]])
-
-# visualisations
-# analyseur.plot_top_stable_factors(master, top_n=12)
-# analyseur.plot_yearly_heatmap(master, top_n=20)
-# analyseur.plot_synergy_scatter(synergy, top_n=30)
