@@ -740,42 +740,60 @@ class FactorStabilityAnalyzer:
         drawdown_limit=0.15,
         min_obs=252,
         min_horizon=252,
-    ) -> pd.DataFrame:
+    ):
         # Fusion de toutes les tables importantes
         stability = self.stability_ranking(
             windows=windows,
             drawdown_limit=drawdown_limit,
             min_obs=min_obs,
         )
-
+    
         start_rob = self.start_date_robustness(min_horizon=min_horizon)
         horizon = self.horizon_success_matrix(horizons=windows)
-
+    
         master = stability.copy()
-
+    
         if start_rob is not None and len(start_rob) > 0:
             master = master.join(start_rob, how="left")
-
+    
         if horizon is not None and len(horizon) > 0:
             master = master.join(horizon, how="left")
-
-        def rank_col(df, col, asc=True):
-            if col not in df.columns:
-                return pd.Series(index=df.index, data=np.nan)
-            return self._safe_rank_pct(df[col], ascending=asc)
-
-        master["robust_uptrend_score"] = (
-            0.30 * rank_col(master, "stability_score", True).fillna(0)
-            + 0.15 * rank_col(master, "start_date_win_rate_to_today", True).fillna(0)
-            + 0.10 * rank_col(master, "start_date_p10_ann_return_to_today", True).fillna(0)
-            + 0.08 * rank_col(master, "calmar", True).fillna(0)
-            + 0.08 * rank_col(master, "trend_r2", True).fillna(0)
-            + 0.08 * rank_col(master, "new_high_share", True).fillna(0)
-            + 0.08 * rank_col(master, "monotonicity", True).fillna(0)
-            + 0.07 * rank_col(master, -master["pct_underwater"] if "pct_underwater" in master.columns else pd.Series(index=master.index), True).fillna(0)
-            + 0.06 * rank_col(master, -master["avg_recovery_duration"].fillna(master["avg_recovery_duration"].max()) if "avg_recovery_duration" in master.columns else pd.Series(index=master.index), True).fillna(0)
+    
+        def rank_col(col, asc=True):
+            # Classement d'une colonne existante
+            if col not in master.columns:
+                return pd.Series(index=master.index, data=np.nan)
+            return self._safe_rank_pct(master[col], ascending=asc)
+    
+        def rank_series(s, asc=True):
+            # Classement d'une série calculée à la volée
+            s = pd.Series(s, index=master.index)
+            return self._safe_rank_pct(s, ascending=asc)
+    
+        pct_underwater_rank = (
+            rank_series(-master["pct_underwater"], True)
+            if "pct_underwater" in master.columns
+            else pd.Series(index=master.index, data=np.nan)
         )
-
+    
+        avg_recovery_rank = (
+            rank_series(-master["avg_recovery_duration"].fillna(master["avg_recovery_duration"].max()), True)
+            if "avg_recovery_duration" in master.columns
+            else pd.Series(index=master.index, data=np.nan)
+        )
+    
+        master["robust_uptrend_score"] = (
+            0.30 * rank_col("stability_score", True).fillna(0)
+            + 0.15 * rank_col("start_date_win_rate_to_today", True).fillna(0)
+            + 0.10 * rank_col("start_date_p10_ann_return_to_today", True).fillna(0)
+            + 0.08 * rank_col("calmar", True).fillna(0)
+            + 0.08 * rank_col("trend_r2", True).fillna(0)
+            + 0.08 * rank_col("new_high_share", True).fillna(0)
+            + 0.08 * rank_col("monotonicity", True).fillna(0)
+            + 0.07 * pct_underwater_rank.fillna(0)
+            + 0.06 * avg_recovery_rank.fillna(0)
+        )
+    
         master = master.sort_values("robust_uptrend_score", ascending=False)
         return master
 
