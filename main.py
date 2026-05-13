@@ -1,8 +1,8 @@
 import re
 import numpy as np
 import pandas as pd
-import matplotlib.pyplot as plt
-import seaborn as sns
+import plotly.express as px
+import plotly.graph_objects as go
 
 
 class FactorStabilityAnalyzer:
@@ -219,7 +219,6 @@ class FactorStabilityAnalyzer:
         for s, e in segments:
             underwater_durations.append(e - s + 1)
 
-            # Épisode complet uniquement si l'on récupère avant la fin
             if e < n - 1 and underwater[e + 1] == False:
                 trough_idx = s + int(np.argmin(dd[s:e + 1]))
                 recovery_idx = e + 1
@@ -478,7 +477,6 @@ class FactorStabilityAnalyzer:
         else:
             out["stability_score"] = np.nan
 
-        # Bonus pour une trajectoire propre et pénalisation du temps underwater
         out["stability_score"] = (
             0.55 * out["stability_score"].fillna(0)
             + 0.10 * self._safe_rank_pct(out["monotonicity"], ascending=True).fillna(0)
@@ -578,7 +576,6 @@ class FactorStabilityAnalyzer:
         for combo in combo_names:
             parts = self.factor_map.loc[combo, "parts"]
 
-            # Vérification de la présence des briques simples
             if not all(p in self.df.columns for p in parts):
                 continue
 
@@ -595,10 +592,7 @@ class FactorStabilityAnalyzer:
             part_df = aligned.iloc[:, 1:]
             part_names = list(part_df.columns)
 
-            # Baseline géométrique des briques simples
             geo_baseline = np.exp(np.log(part_df).mean(axis=1))
-
-            # Baseline du meilleur facteur simple à chaque date
             best_baseline = part_df.max(axis=1)
 
             combo_rel = combo_s / combo_s.iloc[0]
@@ -683,41 +677,10 @@ class FactorStabilityAnalyzer:
                 }
             )
 
-        empty_columns = [
-            "parts",
-            "n_parts",
-            "n_obs",
-            "combo_final_ratio",
-            "geo_baseline_final_ratio",
-            "best_single_final_ratio",
-            "edge_terminal_vs_geo_log",
-            "edge_terminal_vs_best_log",
-            "share_above_geo_path",
-            "share_above_best_path",
-            "combo_monotonicity",
-            "avg_parts_monotonicity",
-            "monotonicity_lift",
-            "combo_max_drawdown",
-            "avg_parts_max_drawdown",
-            "drawdown_lift",
-            "combo_pct_underwater",
-            "avg_parts_pct_underwater",
-            "underwater_lift",
-            "combo_avg_recovery_duration",
-            "avg_parts_avg_recovery_duration",
-            "recovery_lift",
-            f"combo_positive_rate_{window_for_path}d",
-            f"avg_parts_positive_rate_{window_for_path}d",
-            f"positive_rate_lift_{window_for_path}d",
-            "synergy_score",
-        ]
-
         out = pd.DataFrame(records)
 
         if len(out) == 0:
-            out = pd.DataFrame(columns=empty_columns)
-            out.index.name = "combo"
-            return out
+            return pd.DataFrame()
 
         out = out.set_index("combo")
 
@@ -740,48 +703,48 @@ class FactorStabilityAnalyzer:
         drawdown_limit=0.15,
         min_obs=252,
         min_horizon=252,
-    ):
+    ) -> pd.DataFrame:
         # Fusion de toutes les tables importantes
         stability = self.stability_ranking(
             windows=windows,
             drawdown_limit=drawdown_limit,
             min_obs=min_obs,
         )
-    
+
         start_rob = self.start_date_robustness(min_horizon=min_horizon)
         horizon = self.horizon_success_matrix(horizons=windows)
-    
+
         master = stability.copy()
-    
+
         if start_rob is not None and len(start_rob) > 0:
             master = master.join(start_rob, how="left")
-    
+
         if horizon is not None and len(horizon) > 0:
             master = master.join(horizon, how="left")
-    
+
         def rank_col(col, asc=True):
             # Classement d'une colonne existante
             if col not in master.columns:
                 return pd.Series(index=master.index, data=np.nan)
             return self._safe_rank_pct(master[col], ascending=asc)
-    
+
         def rank_series(s, asc=True):
             # Classement d'une série calculée à la volée
             s = pd.Series(s, index=master.index)
             return self._safe_rank_pct(s, ascending=asc)
-    
+
         pct_underwater_rank = (
             rank_series(-master["pct_underwater"], True)
             if "pct_underwater" in master.columns
             else pd.Series(index=master.index, data=np.nan)
         )
-    
+
         avg_recovery_rank = (
             rank_series(-master["avg_recovery_duration"].fillna(master["avg_recovery_duration"].max()), True)
             if "avg_recovery_duration" in master.columns
             else pd.Series(index=master.index, data=np.nan)
         )
-    
+
         master["robust_uptrend_score"] = (
             0.30 * rank_col("stability_score", True).fillna(0)
             + 0.15 * rank_col("start_date_win_rate_to_today", True).fillna(0)
@@ -793,95 +756,137 @@ class FactorStabilityAnalyzer:
             + 0.07 * pct_underwater_rank.fillna(0)
             + 0.06 * avg_recovery_rank.fillna(0)
         )
-    
+
         master = master.sort_values("robust_uptrend_score", ascending=False)
         return master
 
-    def plot_top_stable_factors(self, master_table: pd.DataFrame, top_n: int = 12, figsize=(14, 7)):
-        # Courbes des meilleurs facteurs stables
+    def _maybe_save_html(self, fig, file_name=None, save_html=False):
+        # Sauvegarde optionnelle en HTML interactif
+        if save_html and file_name is not None:
+            fig.write_html(file_name, include_plotlyjs="cdn")
+        return fig
+
+    def plot_top_stable_factors(self, master_table: pd.DataFrame, top_n: int = 12, save_html=False, file_name="top_stable_factors.html"):
+        # Courbes interactives des meilleurs facteurs stables
         top_cols = master_table.head(top_n).index.tolist()
 
-        plt.figure(figsize=figsize)
-
+        plot_df = []
         for col in top_cols:
             s = self._series(col)
             rel = s / s.iloc[0]
-            plt.plot(rel.index, rel.values, linewidth=1.8, alpha=0.9, label=col)
+            tmp = pd.DataFrame({
+                "Date": rel.index,
+                "Ratio": rel.values,
+                "Factor": col
+            })
+            plot_df.append(tmp)
 
-        plt.axhline(1.0, color="black", linestyle="--", linewidth=1.0)
-        plt.title(f"Top {top_n} facteurs par robust_uptrend_score")
-        plt.ylabel("Ratio cumulatif normalisé")
-        plt.xlabel("Date")
-        plt.legend(ncol=2, fontsize=8)
-        plt.tight_layout()
-        plt.show()
+        plot_df = pd.concat(plot_df, axis=0)
 
-    def plot_yearly_heatmap(self, master_table: pd.DataFrame, top_n: int = 20, figsize=(16, 8)):
-        # Heatmap des rendements annuels
+        fig = px.line(
+            plot_df,
+            x="Date",
+            y="Ratio",
+            color="Factor",
+            title=f"Top {top_n} facteurs stables"
+        )
+
+        fig.add_hline(y=1.0, line_dash="dash", line_color="gray")
+        fig.update_layout(
+            hovermode="x unified",
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="center", x=0.5)
+        )
+        fig.update_xaxes(title_text="Date")
+        fig.update_yaxes(title_text="Ratio normalisé")
+
+        self._maybe_save_html(fig, file_name=file_name, save_html=save_html)
+        fig.show()
+        return fig
+
+    def plot_yearly_heatmap(self, master_table: pd.DataFrame, top_n: int = 20, save_html=False, file_name="yearly_heatmap.html"):
+        # Heatmap interactive des rendements annuels
         top_cols = master_table.head(top_n).index.tolist()
         yearly = self.yearly_returns()[top_cols].T
 
-        plt.figure(figsize=figsize)
-        sns.heatmap(
+        fig = px.imshow(
             yearly,
-            cmap="RdYlGn",
-            center=0,
-            annot=False,
-            linewidths=0.3,
-            cbar_kws={"label": "Rendement annuel du ratio"},
+            aspect="auto",
+            color_continuous_scale="RdYlGn",
+            origin="lower",
+            labels=dict(x="Année", y="Facteur", color="Rendement"),
+            title=f"Heatmap annuelle des top {top_n} facteurs stables"
         )
-        plt.title(f"Heatmap annuelle des top {top_n} facteurs stables")
-        plt.xlabel("Année")
-        plt.ylabel("Facteur")
-        plt.tight_layout()
-        plt.show()
 
-    def plot_synergy_scatter(self, synergy_table: pd.DataFrame, top_n: int = 30, label_n: int = 12, figsize=(11, 7)):
-        # Nuage de points amélioré pour la synergie
+        fig.update_xaxes(side="bottom")
+        fig.update_layout(hovermode="closest")
+
+        self._maybe_save_html(fig, file_name=file_name, save_html=save_html)
+        fig.show()
+        return fig
+
+    def plot_synergy_scatter(
+        self,
+        synergy_table: pd.DataFrame,
+        top_n: int = 30,
+        label_n: int = 12,
+        save_html=False,
+        file_name="synergy_scatter.html"
+    ):
+        # Nuage de points interactif pour la synergie
         if synergy_table is None or len(synergy_table) == 0:
             print("Aucune combinaison exploitable.")
-            return
+            return None
 
         x = synergy_table.head(top_n).copy()
+        x = x.reset_index()
 
-        x_axis = "monotonicity_lift"
-        y_axis = "edge_terminal_vs_geo_log"
-        size = 100 + 500 * x["synergy_score"].fillna(0)
+        x["label"] = ""
+        x.loc[:min(label_n - 1, len(x) - 1), "label"] = x.loc[:min(label_n - 1, len(x) - 1), "combo"]
 
-        color_metric = x["underwater_lift"].fillna(0)
-
-        plt.figure(figsize=figsize)
-        sc = plt.scatter(
-            x[x_axis],
-            x[y_axis],
-            s=size,
-            c=color_metric,
-            cmap="RdYlGn_r",
-            alpha=0.8
+        fig = px.scatter(
+            x,
+            x="monotonicity_lift",
+            y="edge_terminal_vs_geo_log",
+            size="synergy_score",
+            color="underwater_lift",
+            hover_name="combo",
+            hover_data=[
+                "parts",
+                "share_above_geo_path",
+                "drawdown_lift",
+                "underwater_lift",
+                "recovery_lift",
+                "synergy_score"
+            ],
+            color_continuous_scale="RdYlGn_r",
+            title="Carte de synergie : stabilité vs gain terminal"
         )
 
-        x_label = x.head(min(label_n, len(x)))
-        for name, row in x_label.iterrows():
-            plt.text(
-                row[x_axis] + 0.001,
-                row[y_axis],
-                name,
-                fontsize=8
-            )
+        fig.update_traces(
+            text=x["label"],
+            textposition="top center",
+            marker=dict(sizemode="area", sizeref=2.0 * max(x["synergy_score"].max(), 1e-6) / (40.0 ** 2))
+        )
 
-        plt.axvline(0.0, color="gray", linestyle="--", linewidth=1.0)
-        plt.axhline(0.0, color="gray", linestyle="--", linewidth=1.0)
+        fig.add_vline(x=0.0, line_dash="dash", line_color="gray")
+        fig.add_hline(y=0.0, line_dash="dash", line_color="gray")
 
-        plt.xlabel("Gain de monotonie vs moyenne des facteurs simples")
-        plt.ylabel("Gain terminal vs baseline géométrique (log)")
-        plt.title("Carte de synergie : stabilité vs gain terminal")
-        cbar = plt.colorbar(sc)
-        cbar.set_label("Underwater lift (plus bas = mieux)")
-        plt.tight_layout()
-        plt.show()
+        fig.update_layout(hovermode="closest")
+        fig.update_xaxes(title_text="Monotonicity lift")
+        fig.update_yaxes(title_text="Terminal edge log")
 
-    def plot_underwater_profile(self, master_table: pd.DataFrame, top_n: int = 15, figsize=(12, 7)):
-        # Profil underwater des facteurs les plus stables
+        self._maybe_save_html(fig, file_name=file_name, save_html=save_html)
+        fig.show()
+        return fig
+
+    def plot_underwater_profile(
+        self,
+        master_table: pd.DataFrame,
+        top_n: int = 15,
+        save_html=False,
+        file_name="underwater_profile.html"
+    ):
+        # Profil interactif underwater des meilleurs facteurs
         cols = master_table.head(top_n).index.tolist()
 
         plot_df = master_table.loc[cols, [
@@ -890,105 +895,96 @@ class FactorStabilityAnalyzer:
             "avg_recovery_duration"
         ]].copy()
 
+        plot_df["factor"] = plot_df.index
         plot_df = plot_df.sort_values("pct_underwater", ascending=True)
 
-        fig, axes = plt.subplots(1, 3, figsize=figsize)
+        fig = go.Figure()
 
-        axes[0].barh(plot_df.index, plot_df["pct_underwater"], color="steelblue")
-        axes[0].set_title("Pct underwater")
-        axes[0].set_xlabel("Part du temps")
+        fig.add_trace(go.Bar(
+            x=plot_df["pct_underwater"],
+            y=plot_df["factor"],
+            name="Pct underwater",
+            orientation="h"
+        ))
 
-        axes[1].barh(plot_df.index, plot_df["max_drawdown"], color="darkorange")
-        axes[1].set_title("Max drawdown")
-        axes[1].set_xlabel("Drawdown")
+        fig.add_trace(go.Bar(
+            x=plot_df["max_drawdown"],
+            y=plot_df["factor"],
+            name="Max drawdown",
+            orientation="h",
+            visible="legendonly"
+        ))
 
-        axes[2].barh(plot_df.index, plot_df["avg_recovery_duration"].fillna(0), color="seagreen")
-        axes[2].set_title("Durée moyenne de récupération")
-        axes[2].set_xlabel("Jours de bourse")
+        fig.add_trace(go.Bar(
+            x=plot_df["avg_recovery_duration"],
+            y=plot_df["factor"],
+            name="Avg recovery",
+            orientation="h",
+            visible="legendonly"
+        ))
 
-        plt.tight_layout()
-        plt.show()
+        fig.update_layout(
+            barmode="group",
+            title=f"Profil underwater des top {top_n} facteurs",
+            hovermode="y unified"
+        )
+        fig.update_xaxes(title_text="Valeur")
+        fig.update_yaxes(title_text="Facteur")
 
-    def plot_single_factor_diagnostics(self, factor_name: str, figsize=(13, 8)):
-        # Diagnostic détaillé d'un facteur unique
+        self._maybe_save_html(fig, file_name=file_name, save_html=save_html)
+        fig.show()
+        return fig
+
+    def plot_single_factor_diagnostics(
+        self,
+        factor_name: str,
+        save_html=False,
+        file_name="single_factor_diagnostics.html"
+    ):
+        # Diagnostic interactif détaillé d'un facteur unique
         s = self._series(factor_name)
         rel = s / s.iloc[0]
         peak = rel.cummax()
         dd = rel / peak - 1.0
 
-        fig, axes = plt.subplots(2, 1, figsize=figsize, sharex=True)
+        fig = go.Figure()
 
-        axes[0].plot(rel.index, rel.values, label=factor_name, linewidth=2.0)
-        axes[0].plot(peak.index, peak.values, linestyle="--", alpha=0.6, label="High-water mark")
-        axes[0].axhline(1.0, color="black", linestyle=":", linewidth=1.0)
-        axes[0].legend()
-        axes[0].set_title(f"Courbe et high-water mark : {factor_name}")
+        fig.add_trace(go.Scatter(
+            x=rel.index,
+            y=rel.values,
+            mode="lines",
+            name="Ratio"
+        ))
 
-        axes[1].fill_between(dd.index, dd.values, 0, color="firebrick", alpha=0.35)
-        axes[1].axhline(0.0, color="black", linewidth=1.0)
-        axes[1].set_title("Courbe underwater")
-        axes[1].set_ylabel("Drawdown")
+        fig.add_trace(go.Scatter(
+            x=peak.index,
+            y=peak.values,
+            mode="lines",
+            name="High-water mark",
+            line=dict(dash="dash")
+        ))
 
-        plt.tight_layout()
-        plt.show()
+        fig.add_trace(go.Scatter(
+            x=dd.index,
+            y=dd.values,
+            mode="lines",
+            name="Underwater",
+            yaxis="y2"
+        ))
 
+        fig.update_layout(
+            title=f"Diagnostic interactif : {factor_name}",
+            hovermode="x unified",
+            yaxis=dict(title="Ratio"),
+            yaxis2=dict(
+                title="Drawdown",
+                overlaying="y",
+                side="right",
+                showgrid=False
+            )
+        )
+        fig.update_xaxes(title_text="Date")
 
-# =========================================================
-# Exemple d'utilisation
-# =========================================================
-
-# 1) Initialisation
-# analyseur = FactorStabilityAnalyzer(df, ann_factor=252)
-
-# 2) Vérification du parsing des combinaisons
-# debug_map = analyseur.debug_combo_mapping(50)
-# print(debug_map)
-
-# 3) Table principale orientée stabilité
-# master = analyseur.build_master_table(
-#     windows=(126, 252, 504),
-#     drawdown_limit=0.15,
-#     min_obs=252,
-#     min_horizon=252
-# )
-
-# 4) Analyse des synergies
-# synergy = analyseur.synergy_analysis(
-#     min_obs=252,
-#     window_for_path=252
-# )
-
-# 5) Affichage des meilleurs facteurs stables
-# cols_master = [
-#     "final_ratio",
-#     "cagr",
-#     "max_drawdown",
-#     "pct_underwater",
-#     "avg_recovery_duration",
-#     "monotonicity",
-#     "new_high_share",
-#     "stability_score",
-#     "robust_uptrend_score"
-# ]
-# print(master.head(20)[cols_master])
-
-# 6) Affichage des meilleures combinaisons
-# cols_synergy = [
-#     "parts",
-#     "edge_terminal_vs_geo_log",
-#     "monotonicity_lift",
-#     "drawdown_lift",
-#     "underwater_lift",
-#     "recovery_lift",
-#     "synergy_score"
-# ]
-# print(synergy.head(20)[cols_synergy])
-
-# 7) Visualisations
-# analyseur.plot_top_stable_factors(master, top_n=12)
-# analyseur.plot_yearly_heatmap(master, top_n=20)
-# analyseur.plot_synergy_scatter(synergy, top_n=30, label_n=12)
-# analyseur.plot_underwater_profile(master, top_n=15)
-
-# 8) Diagnostic détaillé d'un facteur
-# analyseur.plot_single_factor_diagnostics(master.index[0])
+        self._maybe_save_html(fig, file_name=file_name, save_html=save_html)
+        fig.show()
+        return fig
